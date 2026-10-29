@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java
@@ -31,13 +31,11 @@ jobs:
           node-version: '20'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        run: |
-          sdkmanager "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: 'true'
+          log-accepted-android-sdk-licenses: 'false'
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
       - name: Extract project ZIP
         shell: bash
@@ -45,18 +43,20 @@ jobs:
           set -euo pipefail
 
           ZIP_FILE="$(find . -type f -iname '*.zip' \
-            -not -path './.git/*' | head -n 1)"
+            -not -path './.git/*' | head -n 1 || true)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "No ZIP file found in repository."
+            echo "::error::No ZIP file found in repository."
             exit 1
           fi
 
           mkdir -p extracted
           unzip -q "$ZIP_FILE" -d extracted
-          echo "Extracted: $ZIP_FILE"
 
-      - name: Detect project and prepare Android app
+          echo "Extracted project:"
+          find extracted -maxdepth 3 -type f | head -n 100
+
+      - name: Detect and prepare project
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +65,7 @@ jobs:
             -name gradlew -print -quit || true)"
 
           if [ -n "$GRADLE_FILE" ]; then
-            echo "Existing Android Gradle project found."
+            echo "Existing Android project detected."
             echo "PROJECT_DIR=$(dirname "$GRADLE_FILE")" \
               >> "$GITHUB_ENV"
             exit 0
@@ -75,32 +75,19 @@ jobs:
             -name index.html -print -quit || true)"
 
           if [ -z "$INDEX_FILE" ]; then
-            echo "No Android Gradle project or index.html found."
-            echo "Please check the ZIP contents."
+            echo "::error::ZIP contains neither gradlew nor index.html."
             exit 1
           fi
 
-          echo "Web project found: $INDEX_FILE"
-
-          APP_DIR="$GITHUB_WORKSPACE/extracted/kaseb-android"
-          mkdir -p "$APP_DIR/www"
-
           WEB_DIR="$(dirname "$INDEX_FILE")"
+          APP_DIR="$GITHUB_WORKSPACE/android-wrapper"
+
+          mkdir -p "$APP_DIR/www"
           cp -a "$WEB_DIR"/. "$APP_DIR/www/"
 
           cd "$APP_DIR"
 
-          cat > package.json <<'EOF'
-          {
-            "name": "kaseb-android",
-            "version": "1.0.0",
-            "private": true,
-            "description": "Kaseb Android application",
-            "scripts": {
-              "build": "echo Web assets are ready"
-            }
-          }
-          EOF
+          npm init -y
 
           npm install --save-exact \
             @capacitor/core@6 \
@@ -122,20 +109,20 @@ jobs:
 
           echo "PROJECT_DIR=$APP_DIR/android" >> "$GITHUB_ENV"
 
-      - name: Build APK
+      - name: Build Android APK
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_DIR"
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Kaseb-Android-APK
           path: |
             extracted/**/build/outputs/apk/**/*.apk
+            android-wrapper/android/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 14
