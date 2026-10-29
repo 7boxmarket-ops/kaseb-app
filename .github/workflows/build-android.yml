@@ -1,5 +1,5 @@
 
-name: Build Kaseb Android APK
+name: Kaseb Android Release APK
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  build-release:
     runs-on: ubuntu-latest
 
     steps:
@@ -35,7 +35,10 @@ jobs:
         with:
           accept-android-sdk-licenses: 'true'
           log-accepted-android-sdk-licenses: 'false'
-          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+          packages: |
+            platform-tools
+            platforms;android-34
+            build-tools;34.0.0
 
       - name: Extract project ZIP
         shell: bash
@@ -46,17 +49,31 @@ jobs:
             -not -path './.git/*' | head -n 1 || true)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "::error::No ZIP file found in repository."
+            echo "::error::No project ZIP found."
             exit 1
           fi
 
           mkdir -p extracted
           unzip -q "$ZIP_FILE" -d extracted
 
-          echo "Extracted project:"
-          find extracted -maxdepth 3 -type f | head -n 100
+          # Extract nested ZIP files, if present.
+          for level in 1 2 3; do
+            NESTED="$(find extracted -type f \
+              -iname '*.zip' -print -quit || true)"
 
-      - name: Detect and prepare project
+            if [ -z "$NESTED" ]; then
+              break
+            fi
+
+            DEST="extracted/nested-$level"
+            mkdir -p "$DEST"
+            unzip -q "$NESTED" -d "$DEST"
+            rm -f "$NESTED"
+          done
+
+          echo "Project ZIP extracted."
+
+      - name: Prepare Android project
         shell: bash
         run: |
           set -euo pipefail
@@ -65,38 +82,34 @@ jobs:
             -name gradlew -print -quit || true)"
 
           if [ -n "$GRADLE_FILE" ]; then
-            echo "Existing Android project detected."
-            echo "PROJECT_DIR=$(dirname "$GRADLE_FILE")" \
-              >> "$GITHUB_ENV"
-            exit 0
-          fi
+            PROJECT_DIR="$(dirname "$GRADLE_FILE")"
+            echo "Existing Android project found."
+          else
+            INDEX_FILE="$(find extracted -type f \
+              -name index.html -print -quit || true)"
 
-          INDEX_FILE="$(find extracted -type f \
-            -name index.html -print -quit || true)"
+            if [ -z "$INDEX_FILE" ]; then
+              echo "::error::No gradlew or index.html found."
+              exit 1
+            fi
 
-          if [ -z "$INDEX_FILE" ]; then
-            echo "::error::ZIP contains neither gradlew nor index.html."
-            exit 1
-          fi
+            WEB_DIR="$(dirname "$INDEX_FILE")"
+            APP_DIR="$GITHUB_WORKSPACE/android-wrapper"
 
-          WEB_DIR="$(dirname "$INDEX_FILE")"
-          APP_DIR="$GITHUB_WORKSPACE/android-wrapper"
+            mkdir -p "$APP_DIR/www"
+            cp -a "$WEB_DIR"/. "$APP_DIR/www/"
 
-          mkdir -p "$APP_DIR/www"
-          cp -a "$WEB_DIR"/. "$APP_DIR/www/"
+            cd "$APP_DIR"
+            npm init -y
 
-          cd "$APP_DIR"
+            npm install --save-exact \
+              @capacitor/core@6 \
+              @capacitor/android@6
 
-          npm init -y
+            npm install --save-dev --save-exact \
+              @capacitor/cli@6
 
-          npm install --save-exact \
-            @capacitor/core@6 \
-            @capacitor/android@6
-
-          npm install --save-dev --save-exact \
-            @capacitor/cli@6
-
-          cat > capacitor.config.json <<'EOF'
+            cat > capacitor.config.json <<'EOF'
           {
             "appId": "com.sevenbox.kaseb",
             "appName": "کاسب",
@@ -104,25 +117,144 @@ jobs:
           }
           EOF
 
-          npx cap add android
-          npx cap sync android
+            npx cap add android
+            npx cap sync android
 
-          echo "PROJECT_DIR=$APP_DIR/android" >> "$GITHUB_ENV"
+            PROJECT_DIR="$APP_DIR/android"
+          fi
 
-      - name: Build Android APK
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Configure release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
+
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          KEYSTORE_PATH="$RUNNER_TEMP/kaseb-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode \
+            > "$KEYSTORE_PATH"
+
+          test -s "$KEYSTORE_PATH"
+
+          keytool -list \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
+
+          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          gradle = project / "app" / "build.gradle"
+
+          if not gradle.exists():
+              raise SystemExit(
+                  "Expected app/build.gradle. "
+                  "This workflow currently supports Groovy Gradle files."
+              )
+
+          text = gradle.read_text()
+
+          if "signingConfigs {" not in text:
+              match = re.search(r"(?m)^(\s*)buildTypes\s*\{", text)
+              if not match:
+                  raise SystemExit("Could not find buildTypes in build.gradle")
+
+              indent = match.group(1)
+              signing = (
+                  f"{indent}signingConfigs {{\n"
+                  f"{indent}    release {{\n"
+                  f'{indent}        storeFile file(System.getenv("KEYSTORE_PATH"))\n'
+                  f'        storePassword System.getenv("KEYSTORE_PASSWORD")\n'
+                  f'        keyAlias System.getenv("KEY_ALIAS")\n'
+                  f'        keyPassword System.getenv("KEY_PASSWORD")\n'
+                  f"{indent}    }}\n"
+                  f"{indent}}}\n\n"
+              )
+              text = text[:match.start()] + signing + text[match.start():]
+
+          match = re.search(r"\bbuildTypes\s*\{", text)
+          if not match:
+              raise SystemExit("Could not find buildTypes block")
+
+          start = match.end()
+          depth = 1
+          i = start
+
+          while i < len(text) and depth:
+              if text[i] == "{":
+                  depth += 1
+              elif text[i] == "}":
+                  depth -= 1
+              i += 1
+
+          block = text[start:i-1]
+          release = re.search(r"\brelease\s*\{", block)
+
+          if not release:
+              raise SystemExit("Could not find release build type")
+
+          if "signingConfig signingConfigs.release" not in block[release.end():]:
+              insert_at = start + release.end()
+              text = (
+                  text[:insert_at]
+                  + "\n            signingConfig signingConfigs.release"
+                  + text[insert_at:]
+              )
+
+          gradle.write_text(text)
+          print("Release signing configured.")
+          PY
+
+      - name: Build signed Release APK
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/kaseb-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
           cd "$PROJECT_DIR"
           chmod +x gradlew
-          ./gradlew --no-daemon assembleDebug
 
-      - name: Upload APK
+          ./gradlew --no-daemon assembleRelease
+
+          APK="$(find . -type f \
+            -path '*/build/outputs/apk/release/*.apk' \
+            -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::Release APK was not generated."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+          cp "$APK" "$GITHUB_WORKSPACE/apk-output/Kaseb-Release.apk"
+
+          echo "Signed Release APK created."
+
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: Kaseb-Android-APK
-          path: |
-            extracted/**/build/outputs/apk/**/*.apk
-            android-wrapper/android/build/outputs/apk/**/*.apk
+          name: Kaseb-Android-Release
+          path: apk-output/Kaseb-Release.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
