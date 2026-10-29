@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Get source code
         uses: actions/checkout@v4
 
       - name: Set up Java
@@ -25,7 +25,21 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Locate and extract project ZIP
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Extract project ZIP
         shell: bash
         run: |
           set -euo pipefail
@@ -34,46 +48,94 @@ jobs:
             -not -path './.git/*' | head -n 1)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No project ZIP found in repository."
+            echo "No ZIP file found in repository."
             exit 1
           fi
 
           mkdir -p extracted
           unzip -q "$ZIP_FILE" -d extracted
+          echo "Extracted: $ZIP_FILE"
 
-          echo "ZIP extracted successfully."
-          find extracted -maxdepth 3 -type f | head -n 100
-
-      - name: Locate Android Gradle project
+      - name: Detect project and prepare Android app
         shell: bash
         run: |
           set -euo pipefail
 
           GRADLE_FILE="$(find extracted -type f \
-            -name gradlew -print -quit)"
+            -name gradlew -print -quit || true)"
 
-          if [ -z "$GRADLE_FILE" ]; then
-            echo "ERROR: No Gradle wrapper found."
-            echo "The ZIP may be a web project, not a complete Android project."
+          if [ -n "$GRADLE_FILE" ]; then
+            echo "Existing Android Gradle project found."
+            echo "PROJECT_DIR=$(dirname "$GRADLE_FILE")" \
+              >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          INDEX_FILE="$(find extracted -type f \
+            -name index.html -print -quit || true)"
+
+          if [ -z "$INDEX_FILE" ]; then
+            echo "No Android Gradle project or index.html found."
+            echo "Please check the ZIP contents."
             exit 1
           fi
 
-          PROJECT_DIR="$(dirname "$GRADLE_FILE")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Web project found: $INDEX_FILE"
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x "$PROJECT_DIR/gradlew"
+          APP_DIR="$GITHUB_WORKSPACE/extracted/kaseb-android"
+          mkdir -p "$APP_DIR/www"
 
-      - name: Build debug APK
-        working-directory: .
+          WEB_DIR="$(dirname "$INDEX_FILE")"
+          cp -a "$WEB_DIR"/. "$APP_DIR/www/"
+
+          cd "$APP_DIR"
+
+          cat > package.json <<'EOF'
+          {
+            "name": "kaseb-android",
+            "version": "1.0.0",
+            "private": true,
+            "description": "Kaseb Android application",
+            "scripts": {
+              "build": "echo Web assets are ready"
+            }
+          }
+          EOF
+
+          npm install --save-exact \
+            @capacitor/core@6 \
+            @capacitor/android@6
+
+          npm install --save-dev --save-exact \
+            @capacitor/cli@6
+
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.sevenbox.kaseb",
+            "appName": "کاسب",
+            "webDir": "www"
+          }
+          EOF
+
+          npx cap add android
+          npx cap sync android
+
+          echo "PROJECT_DIR=$APP_DIR/android" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        shell: bash
         run: |
+          set -euo pipefail
+
           cd "$PROJECT_DIR"
+          chmod +x gradlew
           ./gradlew --no-daemon assembleDebug
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Kaseb-Android-APK
-          path: extracted/**/build/outputs/apk/**/*.apk
+          path: |
+            extracted/**/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 14
