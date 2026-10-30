@@ -1,3 +1,4 @@
+
 name: Build Kaseb Android Release APK
 
 on:
@@ -16,6 +17,7 @@ permissions:
 jobs:
   build-release:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,10 +26,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           ARCHIVE="kaseb-github-release-project-2.zip"
+
           if [ ! -f "$ARCHIVE" ]; then
             echo "::error::Expected $ARCHIVE in the repository root."
-            echo "Repository files:"
             ls -la
             exit 1
           fi
@@ -36,14 +39,20 @@ jobs:
           unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/kaseb-archive"
 
           PROJECT_ROOT="$(find "$RUNNER_TEMP/kaseb-archive" -type f -name 'capacitor.config.json' -printf '%h\n' | head -n 1)"
-          if [ -z "$PROJECT_ROOT" ] || [ ! -f "$PROJECT_ROOT/package.json" ] || [ ! -d "$PROJECT_ROOT/resources/android" ] || [ ! -f "$PROJECT_ROOT/resources/native/MainActivity.java" ]; then
-            echo '::error::The ZIP does not contain the expected Kaseb project structure.'
+
+          if [ -z "$PROJECT_ROOT" ] || \
+             [ ! -f "$PROJECT_ROOT/package.json" ] || \
+             [ ! -d "$PROJECT_ROOT/resources/android" ] || \
+             [ ! -f "$PROJECT_ROOT/resources/native/MainActivity.java" ]; then
+            echo "::error::The ZIP does not contain the expected Kaseb project structure."
             find "$RUNNER_TEMP/kaseb-archive" -maxdepth 4 -type f | sort | head -200
             exit 1
           fi
 
           cp -a "$PROJECT_ROOT"/. "$GITHUB_WORKSPACE"/
+
           echo "Project extracted from: $PROJECT_ROOT"
+
           test -s package.json
           test -s capacitor.config.json
 
@@ -51,21 +60,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if [ -f source/kaseb-source.zip ]; then
             mkdir -p "$RUNNER_TEMP/kaseb-source"
+
             unzip -oq source/kaseb-source.zip -d "$RUNNER_TEMP/kaseb-source"
+
             SOURCE_HTML="$(find "$RUNNER_TEMP/kaseb-source" -type f -name 'index.html' -print -quit)"
+
             if [ -z "$SOURCE_HTML" ]; then
-              echo '::error::index.html was not found inside source/kaseb-source.zip.'
+              echo "::error::index.html was not found inside source/kaseb-source.zip."
               exit 1
             fi
+
             cp "$SOURCE_HTML" ./index.html
+
           elif [ ! -s index.html ]; then
-            echo '::error::No source/kaseb-source.zip or root index.html found.'
+            echo "::error::No source/kaseb-source.zip or root index.html found."
             exit 1
           fi
+
           test -s index.html
-          echo 'Kaseb web source is ready.'
+          echo "Kaseb web source is ready."
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -80,35 +96,75 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager --install "platform-tools" "build-tools;35.0.0"
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [ -z "$SDK_ROOT" ]; then
+            echo "::error::ANDROID_HOME and ANDROID_SDK_ROOT are both unset."
+            exit 1
+          fi
+
+          APKSIGNER="$SDK_ROOT/build-tools/35.0.0/apksigner"
+
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "::error::apksigner was not found after installing Android Build Tools."
+            find "$SDK_ROOT/build-tools" -type f -name apksigner -print || true
+            exit 1
+          fi
+
+          echo "$SDK_ROOT/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+          echo "Installed Android Build Tools:"
+          "$APKSIGNER" version
+
       - name: Install dependencies and prepare Android project
         shell: bash
         run: |
           set -euo pipefail
+
           npm install
+
           mkdir -p www
           cp index.html www/index.html
+
           if [ ! -d android ]; then
             npx cap add android
           fi
+
           npx cap sync android
 
       - name: Apply Kaseb Android resources and native bridge
         shell: bash
         run: |
           set -euo pipefail
+
           RES="android/app/src/main/res"
           JAVA_DIR="android/app/src/main/java/com/sevenbox/kaseb"
+
           mkdir -p "$RES" "$JAVA_DIR"
 
           find "$RES" -name 'ic_launcher*' -type f -delete
           cp -R resources/android/. "$RES"/
 
           find "$RES" -name 'splash*' -type f -delete
+
           mkdir -p "$RES/drawable"
+
           cat > "$RES/drawable/splash.xml" <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-              <item><color android:color="#FF7A1A" /></item>
+              <item>
+                  <color android:color="#FF7A1A" />
+              </item>
           </layer-list>
           XML
 
@@ -116,11 +172,17 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+
           p = Path('android/app/src/main/AndroidManifest.xml')
           s = p.read_text(encoding='utf-8')
+
           additions = []
+
           if 'android.permission.RECORD_AUDIO' not in s:
-              additions.append('    <uses-permission android:name="android.permission.RECORD_AUDIO" />')
+              additions.append(
+                  '    <uses-permission android:name="android.permission.RECORD_AUDIO" />'
+              )
+
           if 'android.speech.RecognitionService' not in s:
               additions.extend([
                   '    <queries>',
@@ -129,24 +191,44 @@ jobs:
                   '        </intent>',
                   '    </queries>',
               ])
+
           if additions:
               marker = '<application'
+
               if marker not in s:
-                  raise SystemExit('AndroidManifest.xml has no <application> element.')
-              s = s.replace(marker, '\n'.join(additions) + '\n    ' + marker, 1)
+                  raise SystemExit(
+                      'AndroidManifest.xml has no <application> element.'
+                  )
+
+              s = s.replace(
+                  marker,
+                  '\n'.join(additions) + '\n    ' + marker,
+                  1
+              )
+
               p.write_text(s, encoding='utf-8')
+
+          print('AndroidManifest.xml checked.')
           PY
 
       - name: Verify Android configuration
         shell: bash
         run: |
           set -euo pipefail
+
           test -f android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png
-          grep -q 'android.permission.RECORD_AUDIO' android/app/src/main/AndroidManifest.xml
-          grep -q 'KasebNative' android/app/src/main/java/com/sevenbox/kaseb/MainActivity.java
+
+          grep -q 'android.permission.RECORD_AUDIO' \
+            android/app/src/main/AndroidManifest.xml
+
+          grep -q 'KasebNative' \
+            android/app/src/main/java/com/sevenbox/kaseb/MainActivity.java
+
           grep -rqi 'speech-recognition' android
+
           test -s android/app/build.gradle
-          echo 'Kaseb Android configuration checks passed.'
+
+          echo "Kaseb Android configuration checks passed."
 
       - name: Configure release signing
         env:
@@ -157,6 +239,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           for SECRET_NAME in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
             if [ -z "${!SECRET_NAME:-}" ]; then
               echo "::error::Missing GitHub Actions secret: ${SECRET_NAME}"
@@ -165,25 +248,31 @@ jobs:
           done
 
           KEYSTORE_FILE="$RUNNER_TEMP/kaseb-release.jks"
+
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+
           test -s "$KEYSTORE_FILE"
-          keytool -list -keystore "$KEYSTORE_FILE" -storepass "$KEYSTORE_PASSWORD" >/dev/null
+
+          keytool -list \
+            -keystore "$KEYSTORE_FILE" \
+            -storepass "$KEYSTORE_PASSWORD" >/dev/null
+
           echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           gradle_file = Path('android/app/build.gradle')
           content = gradle_file.read_text(encoding='utf-8')
 
-          # This is a freshly generated Capacitor Android project. Add a separate
-          # android {} configuration block instead of relying on a buildTypes block
-          # being present in a particular template version.
-          if 'signingConfigs' in content and 'signingConfig signingConfigs.release' in content:
-              print('Release signing configuration is already present; leaving it unchanged.')
+          if (
+              'signingConfigs' in content
+              and 'signingConfig signingConfigs.release' in content
+          ):
+              print('Release signing configuration already exists.')
+
           else:
-              signing_block = r'''
+              signing_block = '''
           android {
               signingConfigs {
                   release {
@@ -193,6 +282,7 @@ jobs:
                       keyPassword System.getenv("KEY_PASSWORD")
                   }
               }
+
               buildTypes {
                   release {
                       signingConfig signingConfigs.release
@@ -200,18 +290,23 @@ jobs:
               }
           }
           '''
-              # Use an actual newline character; do not write the literal characters \\n              # and n into build.gradle.
+
               content = content.rstrip() + '\n' + signing_block.strip() + '\n'
+
               gradle_file.write_text(content, encoding='utf-8')
 
-          # Fail early if a previous malformed run somehow left a literal \\n          # or another backslash escape as a standalone line in the Gradle file.
-          for number, line in enumerate(gradle_file.read_text(encoding='utf-8').splitlines(), 1):
+          final_content = gradle_file.read_text(encoding='utf-8')
+
+          for number, line in enumerate(final_content.splitlines(), 1):
               if line.strip() in {'\\n', r'\n'}:
-                  raise SystemExit(f'Invalid literal escape found in build.gradle at line {number}.')
+                  raise SystemExit(
+                      f'Invalid literal escape in build.gradle at line {number}.'
+                  )
+
           print('Release signing configuration prepared.')
           PY
 
-          echo '--- build.gradle signing section ---'
+          echo "--- build.gradle signing section ---"
           tail -n 24 android/app/build.gradle
 
       - name: Build signed release APK
@@ -223,17 +318,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cd android
+
           chmod +x gradlew
+
           ./gradlew --no-daemon clean assembleRelease
 
       - name: Verify APK signature
         shell: bash
         run: |
           set -euo pipefail
+
           APK="android/app/build/outputs/apk/release/app-release.apk"
-          test -s "$APK"
-          apksigner verify --verbose --print-certs "$APK"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::Release APK was not generated."
+            exit 1
+          fi
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT/build-tools" ]; then
+            echo "::error::Android SDK Build Tools directory was not found."
+            exit 1
+          fi
+
+          APKSIGNER="$SDK_ROOT/build-tools/35.0.0/apksigner"
+
+          if [ ! -x "$APKSIGNER" ]; then
+            APKSIGNER="$(find "$SDK_ROOT/build-tools" \
+              -type f -name apksigner -perm -u+x | sort -V | tail -n 1)"
+          fi
+
+          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "::error::Could not locate executable apksigner."
+            find "$SDK_ROOT/build-tools" -type f -name apksigner -print || true
+            exit 1
+          fi
+
+          echo "Using apksigner: $APKSIGNER"
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+
+          echo "APK signature verification passed."
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
