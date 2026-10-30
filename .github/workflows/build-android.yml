@@ -1,373 +1,441 @@
 
-name: Build Kaseb Android APK
+name: Build Kaseb Android Release APK
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
+      - master
+    tags:
+      - 'v*'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: kaseb-android-release
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build Signed Android APK
+  build-release:
+    name: Build Signed Kaseb APK
     runs-on: ubuntu-latest
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
+      # --------------------------------------------------
+      # 2. Node.js 20
+      # --------------------------------------------------
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Locate and extract project
+      # --------------------------------------------------
+      # 3. Java 21
+      # --------------------------------------------------
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # --------------------------------------------------
+      # 4. Extract actual Kaseb source
+      # --------------------------------------------------
+      - name: Extract Kaseb source
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find . -maxdepth 2 -type f -name '*.zip' | head -n 1 || true)"
+          if [ -f "source/kaseb-source.zip" ]; then
+            mkdir -p "$RUNNER_TEMP/kaseb-source"
 
-          if [ -n "$ZIP_FILE" ]; then
-            echo "Extracting: $ZIP_FILE"
-            mkdir -p extracted
-            unzip -q "$ZIP_FILE" -d extracted
-            SEARCH_ROOT="extracted"
-          else
-            SEARCH_ROOT="."
-          fi
+            unzip -o "source/kaseb-source.zip" \
+              -d "$RUNNER_TEMP/kaseb-source"
 
-          GRADLE_FILE="$(find "$SEARCH_ROOT" -type f -name gradlew | head -n 1 || true)"
-
-          if [ -n "$GRADLE_FILE" ]; then
-            PROJECT_DIR="$(dirname "$GRADLE_FILE")"
-          else
-            INDEX_FILE="$(find "$SEARCH_ROOT" -type f -name index.html | head -n 1 || true)"
-
-            if [ -z "$INDEX_FILE" ]; then
-              echo "ERROR: Neither gradlew nor index.html was found."
+            if [ ! -s "$RUNNER_TEMP/kaseb-source/index.html" ]; then
+              echo "::error::index.html was not found in source ZIP."
               exit 1
             fi
 
-            WEB_DIR="$(dirname "$INDEX_FILE")"
-            mkdir -p android-wrapper/www
-            cp -a "$WEB_DIR"/. android-wrapper/www/
+            cp "$RUNNER_TEMP/kaseb-source/index.html" ./index.html
 
-            cd android-wrapper
+            echo "Kaseb source extracted successfully."
 
-            npm init -y
-            npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          elif [ -s "index.html" ]; then
+            echo "Using existing index.html."
 
-            npx cap init "کاسب" com.sevenbox.kaseb --web-dir=www
-            npx cap add android
-
-            cd ..
-
-            PROJECT_DIR="android-wrapper/android"
+          else
+            echo "::error::Kaseb source ZIP or index.html is missing."
+            exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Android project: $PROJECT_DIR"
+      # --------------------------------------------------
+      # 5. Install Capacitor 7 dependencies
+      # --------------------------------------------------
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          npm install --no-audit --no-fund
+
+          echo "Checking Capacitor versions..."
+
+          npm ls @capacitor/core
+          npm ls @capacitor/android
+          npm ls @capacitor/cli
+
+          mkdir -p www
+          cp index.html www/index.html
+
+      # --------------------------------------------------
+      # 6. Create Android project
+      # --------------------------------------------------
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d android ]; then
+            echo "Unexpected pre-existing Android directory."
+            echo "This workflow expects a fresh generated Android project."
+            exit 1
+          fi
+
+          npx cap add android
+
+          npx cap sync android
+
+          test -f android/gradlew
+          test -f android/app/src/main/AndroidManifest.xml
+
+          echo "Android project generated successfully."
+
+      # --------------------------------------------------
+      # 7. Install Android SDK
+      # --------------------------------------------------
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK packages
-        run: |
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-
-      - name: Configure launcher icons
         shell: bash
         run: |
           set -euo pipefail
 
-          APP_DIR="$PROJECT_DIR/app"
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
-          if [ ! -d "$APP_DIR" ]; then
-            echo "ERROR: Android app directory not found: $APP_DIR"
+      # --------------------------------------------------
+      # 8. Apply Kaseb launcher icons
+      # --------------------------------------------------
+      - name: Apply Kaseb launcher icons
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RES="android/app/src/main/res"
+
+          if [ ! -d "resources/android" ]; then
+            echo "::error::resources/android directory is missing."
             exit 1
           fi
 
-          RES="$APP_DIR/src/main/res"
+          test -f "resources/android/mipmap-xxxhdpi/ic_launcher.png"
+          test -f "resources/android/mipmap-xxxhdpi/ic_launcher_foreground.png"
+          test -f "resources/android/mipmap-anydpi-v26/ic_launcher.xml"
+
           mkdir -p "$RES"
 
-          python3 -m pip install --quiet pillow
+          cp -a resources/android/. "$RES/"
 
-          ICON_SOURCE=""
+          echo "Kaseb launcher icons copied."
 
-          for candidate in \
-            "1000170973.png" \
-            "icon.png" \
-            "logo.png" \
-            "app-icon.png" \
-            "app_icon.png"
-          do
-            FOUND="$(find . -type f -iname "$candidate" \
-              -not -path './.git/*' \
-              -not -path '*/build/*' | head -n 1 || true)"
-
-            if [ -n "$FOUND" ]; then
-              ICON_SOURCE="$FOUND"
-              break
-            fi
-          done
-
-          if [ -z "$ICON_SOURCE" ]; then
-            echo "ERROR: Launcher icon image was not found."
-            echo "Add the intended logo to the repository as 1000170973.png"
-            exit 1
-          fi
-
-          echo "Using launcher icon: $ICON_SOURCE"
-
-          python3 - "$ICON_SOURCE" "$RES" <<'PY'
-          from PIL import Image, ImageOps
-          import os
-          import sys
-
-          source = sys.argv[1]
-          res = sys.argv[2]
-
-          image = Image.open(source).convert("RGBA")
-          image = ImageOps.contain(image, (720, 720), Image.Resampling.LANCZOS)
-
-          canvas = Image.new("RGBA", (1024, 1024), (255, 112, 0, 255))
-          x = (1024 - image.width) // 2
-          y = (1024 - image.height) // 2
-          canvas.alpha_composite(image, (x, y))
-
-          sizes = {
-              "mdpi": 48,
-              "hdpi": 72,
-              "xhdpi": 96,
-              "xxhdpi": 144,
-              "xxxhdpi": 192,
-          }
-
-          for density, size in sizes.items():
-              folder = os.path.join(res, f"mipmap-{density}")
-              os.makedirs(folder, exist_ok=True)
-
-              icon = canvas.resize((size, size), Image.Resampling.LANCZOS)
-              icon.save(os.path.join(folder, "ic_launcher.png"))
-
-              round_icon = icon.copy()
-              round_icon.save(os.path.join(folder, "ic_launcher_round.png"))
-
-          adaptive = os.path.join(res, "mipmap-anydpi-v26")
-          os.makedirs(adaptive, exist_ok=True)
-
-          with open(os.path.join(adaptive, "ic_launcher.xml"), "w") as f:
-              f.write('''<?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/ic_launcher_background"/>
-              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
-          </adaptive-icon>''')
-
-          with open(os.path.join(adaptive, "ic_launcher_round.xml"), "w") as f:
-              f.write('''<?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/ic_launcher_background"/>
-              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
-          </adaptive-icon>''')
-
-          colors = os.path.join(res, "values")
-          os.makedirs(colors, exist_ok=True)
-
-          with open(os.path.join(colors, "ic_launcher_background.xml"), "w") as f:
-              f.write('''<?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <color name="ic_launcher_background">#FF7000</color>
-          </resources>''')
-
-          foreground = os.path.join(res, "mipmap-anydpi-v26")
-          os.makedirs(foreground, exist_ok=True)
-
-          foreground_image = canvas.resize((432, 432), Image.Resampling.LANCZOS)
-          foreground_dir = os.path.join(res, "drawable")
-          os.makedirs(foreground_dir, exist_ok=True)
-          foreground_image.save(os.path.join(foreground_dir, "ic_launcher_foreground.png"))
-
-          print("Launcher icon resources generated.")
-          PY
-
-      - name: Fix Android manifest namespace and launcher icon
+      # --------------------------------------------------
+      # 9. Install native print and backup bridge
+      # --------------------------------------------------
+      - name: Install Kaseb native bridge
         shell: bash
         run: |
           set -euo pipefail
 
-          APP_DIR="$PROJECT_DIR/app"
-          MANIFEST="$APP_DIR/src/main/AndroidManifest.xml"
+          SOURCE="resources/native/MainActivity.java"
+          TARGET="android/app/src/main/java/com/sevenbox/kaseb/MainActivity.java"
 
-          if [ ! -f "$MANIFEST" ]; then
-            echo "ERROR: AndroidManifest.xml not found: $MANIFEST"
+          if [ ! -s "$SOURCE" ]; then
+            echo "::error::Kaseb native MainActivity.java is missing."
             exit 1
           fi
 
-          python3 - "$MANIFEST" <<'PY'
-          import re
-          import sys
+          mkdir -p "$(dirname "$TARGET")"
+
+          cp "$SOURCE" "$TARGET"
+
+          grep -q "KasebNative" "$TARGET"
+
+          echo "Native print and backup bridge installed."
+
+      # --------------------------------------------------
+      # 10. Safely configure Android Manifest
+      # --------------------------------------------------
+      - name: Configure Android permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
           import xml.etree.ElementTree as ET
+          from pathlib import Path
 
-          path = sys.argv[1]
+          manifest = Path(
+              "android/app/src/main/AndroidManifest.xml"
+          )
 
-          with open(path, "r", encoding="utf-8") as f:
-              content = f.read()
+          if not manifest.exists():
+              raise SystemExit("AndroidManifest.xml is missing.")
 
-          if not re.search(r'<manifest\b[^>]*>', content):
-              raise SystemExit("ERROR: Manifest root element not found.")
+          ANDROID = "http://schemas.android.com/apk/res/android"
 
-          root_match = re.search(r'<manifest\b[^>]*>', content)
-          root_tag = root_match.group(0)
+          ET.register_namespace("android", ANDROID)
 
-          if not re.search(r'xmlns:android\s*=', root_tag):
-              root_tag = root_tag[:-1] + ' xmlns:android="http://schemas.android.com/apk/res/android">'
-              content = content[:root_match.start()] + root_tag + content[root_match.end():]
+          tree = ET.parse(manifest)
+          root = tree.getroot()
 
-          def update_attribute(tag_name, attribute, value):
-              global content
+          if root.tag != "manifest":
+              raise SystemExit("Invalid manifest root element.")
 
-              pattern = rf'<{tag_name}\b[^>]*>'
+          application = root.find("application")
 
-              match = re.search(pattern, content, flags=re.DOTALL)
+          if application is None:
+              raise SystemExit("Manifest application element is missing.")
 
-              if not match:
-                  return
+          permission_name = "android.permission.RECORD_AUDIO"
 
-              tag = match.group(0)
-              attr_pattern = rf'\bandroid:{attribute}\s*=\s*["\'][^"\']*["\']'
+          permission_exists = any(
+              element.tag == "uses-permission"
+              and element.get(f"{{{ANDROID}}}name") == permission_name
+              for element in root
+          )
 
-              if re.search(attr_pattern, tag):
-                  tag = re.sub(
-                      attr_pattern,
-                      f'android:{attribute}="{value}"',
-                      tag
-                  )
-              else:
-                  tag = tag[:-1] + f' android:{attribute}="{value}">'
+          application_index = list(root).index(application)
 
-              content = content[:match.start()] + tag + content[match.end():]
+          if not permission_exists:
+              permission = ET.Element("uses-permission")
+              permission.set(f"{{{ANDROID}}}name", permission_name)
 
-          update_attribute("application", "icon", "@mipmap/ic_launcher")
-          update_attribute("application", "roundIcon", "@mipmap/ic_launcher_round")
+              root.insert(application_index, permission)
+              application_index += 1
 
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(content)
+          # Speech recognition service visibility for Android 11+
+          queries = root.find("queries")
 
-          try:
+          if queries is None:
+              queries = ET.Element("queries")
+              root.insert(application_index, queries)
+
+          action_name = "android.speech.RecognitionService"
+
+          action_exists = any(
+              element.tag == "action"
+              and element.get(f"{{{ANDROID}}}name") == action_name
+              for element in queries.iter()
+          )
+
+          if not action_exists:
+              intent = ET.SubElement(queries, "intent")
+              action = ET.SubElement(intent, "action")
+              action.set(f"{{{ANDROID}}}name", action_name)
+
+          tree.write(
+              manifest,
+              encoding="utf-8",
+              xml_declaration=True
+          )
+
+          # Parse the final file again to catch XML errors.
+          ET.parse(manifest)
+
+          print("Manifest XML is valid.")
+          print("Microphone permission configured.")
+          print("Speech recognition query configured.")
+          PY
+
+          echo "--- Final AndroidManifest.xml ---"
+          cat android/app/src/main/AndroidManifest.xml
+
+      # --------------------------------------------------
+      # 11. Verify native configuration
+      # --------------------------------------------------
+      - name: Verify Kaseb Android configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          test -s "$MANIFEST"
+          test -s "android/app/src/main/java/com/sevenbox/kaseb/MainActivity.java"
+
+          grep -q "android.permission.RECORD_AUDIO" "$MANIFEST"
+
+          grep -q "KasebNative" \
+            android/app/src/main/java/com/sevenbox/kaseb/MainActivity.java
+
+          grep -rqi "speech-recognition" android/capacitor.settings.gradle
+
+          python3 <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          files = list(Path("android").rglob("AndroidManifest.xml"))
+
+          if not files:
+              raise SystemExit("No Android manifests found.")
+
+          for path in files:
               ET.parse(path)
-          except ET.ParseError as error:
-              raise SystemExit(f"ERROR: Invalid AndroidManifest.xml: {error}")
+              print("Valid XML:", path)
 
-          print("Manifest XML validated.")
+          print("All Android manifests passed XML validation.")
           PY
 
-          echo "Manifest after patch:"
-          cat "$MANIFEST"
-
-      - name: Check Android manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          find "$PROJECT_DIR" -path '*/src/*/AndroidManifest.xml' -type f -print
-
-          while IFS= read -r manifest; do
-            echo "Checking: $manifest"
-            python3 - "$manifest" <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          path = sys.argv[1]
-          ET.parse(path)
-          print("Valid XML:", path)
-          PY
-          done < <(find "$PROJECT_DIR" -path '*/src/*/AndroidManifest.xml' -type f)
-
-      - name: Configure release signing
+      # --------------------------------------------------
+      # 12. Configure release signing
+      # --------------------------------------------------
+      - name: Prepare release signing
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "ERROR: KEYSTORE_BASE64 secret is missing."
-            exit 1
-          fi
-
-          mkdir -p "$HOME/.android"
-          echo "$KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/release.keystore"
-
-          echo "KEYSTORE_PATH=$HOME/.android/release.keystore" >> "$GITHUB_ENV"
-
-      - name: Make Gradle executable
-        run: chmod +x "$PROJECT_DIR/gradlew"
-
-      - name: Build signed release APK
-        shell: bash
-        env:
-          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
-          cd "$PROJECT_DIR"
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::KEYSTORE_BASE64 is missing."
+            exit 1
+          fi
 
-          ./gradlew --no-daemon --stacktrace \
+          if [ -z "${KEYSTORE_PASSWORD:-}" ]; then
+            echo "::error::KEYSTORE_PASSWORD is missing."
+            exit 1
+          fi
+
+          if [ -z "${KEY_ALIAS:-}" ]; then
+            echo "::error::KEY_ALIAS is missing."
+            exit 1
+          fi
+
+          if [ -z "${KEY_PASSWORD:-}" ]; then
+            echo "::error::KEY_PASSWORD is missing."
+            exit 1
+          fi
+
+          KEYSTORE="$RUNNER_TEMP/kaseb-release.jks"
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+
+          test -s "$KEYSTORE"
+
+          echo "KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+
+          echo "Release keystore prepared."
+
+      # --------------------------------------------------
+      # 13. Build signed release APK
+      # --------------------------------------------------
+      - name: Build signed release APK
+        shell: bash
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/kaseb-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          cd android
+
+          chmod +x gradlew
+
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
             -Pandroid.injected.signing.store.file="$KEYSTORE_PATH" \
-            -Pandroid.injected.signing.store.password="$STORE_PASSWORD" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
             -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
             -Pandroid.injected.signing.key.password="$KEY_PASSWORD" \
             assembleRelease
 
-      - name: Locate APK
-        id: apk
+      # --------------------------------------------------
+      # 14. Locate APK
+      # --------------------------------------------------
+      - name: Collect release APK
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/release/*.apk' | head -n 1 || true)"
+          APK="$(find android/app/build/outputs/apk/release \
+            -type f -name '*.apk' | head -n 1 || true)"
 
           if [ -z "$APK" ]; then
-            echo "ERROR: Release APK was not generated."
+            echo "::error::Release APK was not generated."
             exit 1
           fi
 
           mkdir -p release-output
+
           cp "$APK" release-output/Kaseb-release.apk
 
-          echo "APK_PATH=release-output/Kaseb-release.apk" >> "$GITHUB_ENV"
+          test -s release-output/Kaseb-release.apk
 
           ls -lh release-output/Kaseb-release.apk
 
+      # --------------------------------------------------
+      # 15. Verify APK signature
+      # --------------------------------------------------
       - name: Verify APK signature
         shell: bash
         run: |
           set -euo pipefail
 
-          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
 
-          if [ -x "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --verbose "$APK_PATH"
-          else
-            echo "WARNING: apksigner not found; signature verification skipped."
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "::error::apksigner is missing."
+            exit 1
           fi
 
+          "$APKSIGNER" verify --verbose --print-certs \
+            release-output/Kaseb-release.apk
+
+      # --------------------------------------------------
+      # 16. Upload APK artifact
+      # --------------------------------------------------
       - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: Kaseb-Android-Release
+          name: kaseb-android-release
           path: release-output/Kaseb-release.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+      # --------------------------------------------------
+      # 17. Attach APK to GitHub Release
+      # --------------------------------------------------
+      - name: Publish APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-output/Kaseb-release.apk
+          generate_release_notes: true
