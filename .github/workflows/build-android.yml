@@ -52,10 +52,12 @@ jobs:
             exit 1
           fi
 
+          echo "Project ZIP: $ZIP_PATH"
           unzip -q "$ZIP_PATH" -d extracted
 
           GRADLEW="$(find extracted -type f -name gradlew \
-            ! -path '*/node_modules/*' -print -quit)"
+            ! -path '*/node_modules/*' \
+            -print -quit)"
 
           if [ -n "$GRADLEW" ]; then
             PROJECT_DIR="$(cd "$(dirname "$GRADLEW")" && pwd)"
@@ -64,7 +66,8 @@ jobs:
           else
             INDEX_HTML="$(find extracted -type f -name index.html \
               ! -path '*/node_modules/*' \
-              ! -path '*/.git/*' -print -quit)"
+              ! -path '*/.git/*' \
+              -print -quit)"
 
             if [ -z "$INDEX_HTML" ]; then
               echo "::error::index.html not found."
@@ -90,13 +93,14 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
 
-      - name: Install Android SDK
+      - name: Prepare Android SDK
         shell: bash
         run: |
           set -euo pipefail
 
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager -print | sort -V | tail -n 1)"
+            -type f -name sdkmanager \
+            -print 2>/dev/null | sort -V | tail -n 1)"
 
           if [ -z "$SDKMANAGER" ]; then
             echo "::error::sdkmanager not found."
@@ -108,35 +112,112 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      - name: Generate launcher icons
+      - name: Generate Android launcher icons
         shell: bash
         run: |
           set -euo pipefail
 
-          ICON_SOURCE="$(find extracted -type f \
-            \( -iname '1000170973.png' \
-            -o -iname 'icon.png' \
-            -o -iname 'app-icon.png' \
-            -o -iname 'logo.png' \) \
-            ! -path '*/node_modules/*' \
-            -print -quit)"
-
-          if [ -z "$ICON_SOURCE" ]; then
-            echo "::error::Launcher icon image not found."
-            exit 1
-          fi
-
           python3 -m pip install --quiet Pillow
 
-          export ICON_SOURCE APP_DIR
+          export APP_DIR
 
           python3 - <<'PY'
           import os
+          import zipfile
+          import tempfile
+          from pathlib import Path
           from PIL import Image
 
-          source = Image.open(os.environ["ICON_SOURCE"]).convert("RGBA")
-          res = os.path.join(os.environ["APP_DIR"], "src/main/res")
+          root = Path("extracted")
+          app = Path(os.environ["APP_DIR"])
+          temp = Path(tempfile.mkdtemp())
 
+          extensions = {".png", ".jpg", ".jpeg", ".webp"}
+          candidates = []
+
+          def add_image(path):
+              try:
+                  with Image.open(path) as im:
+                      im.verify()
+                  candidates.append(Path(path))
+              except Exception:
+                  pass
+
+          # Search images in the extracted project.
+          for path in root.rglob("*"):
+              if path.is_file() and path.suffix.lower() in extensions:
+                  if "node_modules" not in path.parts:
+                      add_image(path)
+
+          # Search images inside nested ZIP files.
+          for archive in root.rglob("*.zip"):
+              try:
+                  with zipfile.ZipFile(archive) as z:
+                      for info in z.infolist():
+                          if Path(info.filename).suffix.lower() not in extensions:
+                              continue
+
+                          if info.file_size > 20 * 1024 * 1024:
+                              continue
+
+                          target = temp / (
+                              str(len(candidates)) +
+                              Path(info.filename).suffix.lower()
+                          )
+
+                          with z.open(info) as src:
+                              target.write_bytes(src.read())
+
+                          add_image(target)
+
+              except Exception as error:
+                  print("Nested ZIP skipped:", error)
+
+          if not candidates:
+              raise SystemExit("No valid images found in project ZIP.")
+
+          # Prefer icon/logo images and square, sufficiently large images.
+          def score(path):
+              name = str(path).lower()
+              value = 0
+
+              if "icon" in name:
+                  value += 100
+              if "logo" in name:
+                  value += 80
+              if "kaseb" in name:
+                  value += 50
+
+              try:
+                  with Image.open(path) as im:
+                      width, height = im.size
+                      if width and height:
+                          value += int(
+                              min(width, height) /
+                              max(width, height) * 30
+                          )
+                      if width >= 256 and height >= 256:
+                          value += 20
+              except Exception:
+                  return -1
+
+              return value
+
+          candidates.sort(key=score, reverse=True)
+
+          # Explicitly report candidates for verification.
+          for path in candidates[:10]:
+              print("IMAGE CANDIDATE:", path, score(path))
+
+          selected = candidates[0]
+          print("SELECTED ICON:", selected)
+
+          with Image.open(selected) as im:
+              logo = im.convert("RGBA")
+
+          res = app / "src/main/res"
+
+          # Legacy launcher icons.
           sizes = {
               "mipmap-mdpi": 48,
               "mipmap-hdpi": 72,
@@ -146,64 +227,91 @@ jobs:
           }
 
           for folder, size in sizes.items():
-              path = os.path.join(res, folder)
-              os.makedirs(path, exist_ok=True)
+              directory = res / folder
+              directory.mkdir(parents=True, exist_ok=True)
 
-              canvas = Image.new("RGBA", (size, size), "#FF7000")
-              logo = source.copy()
-              logo.thumbnail(
+              canvas = Image.new(
+                  "RGBA", (size, size), "#FF7000"
+              )
+
+              icon = logo.copy()
+              icon.thumbnail(
                   (int(size * 0.82), int(size * 0.82)),
                   Image.Resampling.LANCZOS
               )
 
               canvas.alpha_composite(
-                  logo,
-                  ((size-logo.width)//2, (size-logo.height)//2)
+                  icon,
+                  (
+                      (size - icon.width) // 2,
+                      (size - icon.height) // 2
+                  )
               )
 
-              canvas.save(os.path.join(path, "ic_launcher.png"),
-                          optimize=True)
-              canvas.save(os.path.join(path, "ic_launcher_round.png"),
-                          optimize=True)
+              canvas.save(
+                  directory / "ic_launcher.png",
+                  optimize=True
+              )
+              canvas.save(
+                  directory / "ic_launcher_round.png",
+                  optimize=True
+              )
 
-          # Adaptive icon foreground
-          path = os.path.join(res, "drawable")
-          os.makedirs(path, exist_ok=True)
+          # Adaptive icon foreground.
+          directory = res / "drawable"
+          directory.mkdir(parents=True, exist_ok=True)
 
-          canvas = Image.new("RGBA", (432, 432), (0, 0, 0, 0))
-          logo = source.copy()
-          logo.thumbnail((280, 280), Image.Resampling.LANCZOS)
-          canvas.alpha_composite(
-              logo,
-              ((432-logo.width)//2, (432-logo.height)//2)
+          foreground = Image.new(
+              "RGBA", (432, 432), (0, 0, 0, 0)
           )
-          canvas.save(
-              os.path.join(path, "ic_launcher_foreground.png"),
+
+          icon = logo.copy()
+          icon.thumbnail(
+              (280, 280),
+              Image.Resampling.LANCZOS
+          )
+
+          foreground.alpha_composite(
+              icon,
+              (
+                  (432 - icon.width) // 2,
+                  (432 - icon.height) // 2
+              )
+          )
+
+          foreground.save(
+              directory / "ic_launcher_foreground.png",
               optimize=True
           )
 
-          path = os.path.join(res, "values")
-          os.makedirs(path, exist_ok=True)
+          # Adaptive icon background.
+          directory = res / "values"
+          directory.mkdir(parents=True, exist_ok=True)
 
-          with open(os.path.join(path, "ic_launcher_background.xml"), "w") as f:
-              f.write(
-                  '<resources><color name="ic_launcher_background">'
-                  '#FF7000</color></resources>'
-              )
+          (directory / "ic_launcher_background.xml").write_text(
+              '<resources><color name="ic_launcher_background">'
+              '#FF7000</color></resources>',
+              encoding="utf-8"
+          )
 
-          path = os.path.join(res, "mipmap-anydpi-v26")
-          os.makedirs(path, exist_ok=True)
+          directory = res / "mipmap-anydpi-v26"
+          directory.mkdir(parents=True, exist_ok=True)
 
           adaptive = '''<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/ic_launcher_background"/>
               <foreground android:drawable="@drawable/ic_launcher_foreground"/>
           </adaptive-icon>'''
 
-          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
-              with open(os.path.join(path, name), "w") as f:
-                  f.write(adaptive)
+          for filename in (
+              "ic_launcher.xml",
+              "ic_launcher_round.xml"
+          ):
+              (directory / filename).write_text(
+                  adaptive,
+                  encoding="utf-8"
+              )
 
-          print("Android launcher icons generated.")
+          print("Launcher icons generated successfully.")
           PY
 
       - name: Configure Android manifest
@@ -227,11 +335,17 @@ jobs:
           root = tree.getroot()
 
           android = "{http://schemas.android.com/apk/res/android}"
+
           root.set(android + "icon", "@mipmap/ic_launcher")
           root.set(android + "roundIcon", "@mipmap/ic_launcher_round")
 
-          tree.write(path, encoding="utf-8", xml_declaration=True)
-          print("Manifest launcher icons configured.")
+          tree.write(
+              path,
+              encoding="utf-8",
+              xml_declaration=True
+          )
+
+          print("Android manifest updated.")
           PY
 
       - name: Configure release signing
@@ -248,14 +362,14 @@ jobs:
              [ -z "$KEYSTORE_PASSWORD" ] || \
              [ -z "$KEY_ALIAS" ] || \
              [ -z "$KEY_PASSWORD" ]; then
-            echo "::error::Release signing secrets are missing."
+            echo "::error::Signing secrets are missing."
             exit 1
           fi
 
           KEYSTORE_PATH="$RUNNER_TEMP/kaseb-release.jks"
 
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode \
-            > "$KEYSTORE_PATH"
+          printf '%s' "$KEYSTORE_BASE64" |
+            base64 --decode > "$KEYSTORE_PATH"
 
           keytool -list \
             -keystore "$KEYSTORE_PATH" \
@@ -273,7 +387,7 @@ jobs:
           set -euo pipefail
 
           cd "$PROJECT_DIR"
-          chmod +x gradlew
+          chmod +x ./gradlew
 
           ./gradlew --no-daemon clean assembleRelease \
             "-Pandroid.injected.signing.store.file=$KEYSTORE_PATH" \
@@ -281,7 +395,7 @@ jobs:
             "-Pandroid.injected.signing.key.alias=$KEY_ALIAS" \
             "-Pandroid.injected.signing.key.password=$KEY_PASSWORD"
 
-      - name: Verify APK and collect
+      - name: Verify and collect APK
         shell: bash
         run: |
           set -euo pipefail
@@ -300,6 +414,7 @@ jobs:
           "$APKSIGNER" verify --verbose "$APK_PATH"
 
           mkdir -p apk-output
+
           cp "$APK_PATH" apk-output/Kaseb-Release.apk
 
           ls -lh apk-output/Kaseb-Release.apk
