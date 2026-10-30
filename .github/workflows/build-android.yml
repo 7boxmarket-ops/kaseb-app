@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. استخراج ZIP اصلی پروژه
+      # 2. استخراج ZIP پروژه
       - name: Extract Kaseb project
         shell: bash
         run: |
@@ -43,8 +43,6 @@ jobs:
           fi
 
           mkdir -p "$TEMP"
-
-          echo "Extracting project ZIP..."
           unzip -oq "$ARCHIVE" -d "$TEMP"
 
           PROJECT_ROOT=""
@@ -62,45 +60,40 @@ jobs:
           done < <(find "$TEMP" -type f -name package.json -print0)
 
           if [ -z "$PROJECT_ROOT" ]; then
-            echo "::error::Could not find Kaseb project root inside ZIP."
+            echo "::error::Kaseb project root not found inside ZIP."
             find "$TEMP" -maxdepth 6 -type f | sort
             exit 1
           fi
 
           echo "Project root: $PROJECT_ROOT"
 
-          # انتقال محتوای پروژه به ریشه مخزن
           cp -a "$PROJECT_ROOT"/. "$WORK"/
 
-          # استخراج HTML اصلی برنامه
+          # استخراج HTML اصلی
           if [ -f "$WORK/source/kaseb-source.zip" ]; then
             mkdir -p "$RUNNER_TEMP/kaseb-source"
 
             unzip -oq "$WORK/source/kaseb-source.zip" \
               -d "$RUNNER_TEMP/kaseb-source"
 
-            if [ ! -s "$RUNNER_TEMP/kaseb-source/index.html" ]; then
-              echo "::error::index.html missing inside source ZIP."
-              exit 1
-            fi
+            test -s "$RUNNER_TEMP/kaseb-source/index.html"
 
             cp "$RUNNER_TEMP/kaseb-source/index.html" \
               "$WORK/index.html"
 
           elif [ -s "$WORK/index.html" ]; then
-            echo "Using project index.html."
+            echo "Using existing index.html."
 
           else
             echo "::error::Kaseb index.html was not found."
             exit 1
           fi
 
-          # بررسی فایل‌های ضروری
-          test -s "$WORK/index.html"
           test -f "$WORK/package.json"
           test -f "$WORK/capacitor.config.json"
           test -d "$WORK/resources/android"
           test -f "$WORK/resources/native/MainActivity.java"
+          test -s "$WORK/index.html"
 
           echo "Kaseb project extracted successfully."
 
@@ -110,14 +103,14 @@ jobs:
         with:
           node-version: '20'
 
-      # 4. نصب Java 21
+      # 4. نصب Java
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      # 5. نصب وابستگی‌ها و ساخت پروژه Android
+      # 5. نصب وابستگی‌ها و آماده‌سازی Capacitor
       - name: Install dependencies and prepare Android
         shell: bash
         run: |
@@ -151,7 +144,6 @@ jobs:
 
           # صفحه شروع
           find "$RES" -name 'splash*' -type f -delete
-
           mkdir -p "$RES/drawable"
 
           cat > "$RES/drawable/splash.xml" <<'XML'
@@ -163,7 +155,7 @@ jobs:
           </layer-list>
           XML
 
-          # پل بومی چاپ و پشتیبان‌گیری
+          # پل بومی برنامه
           mkdir -p "$JAVA_DIR"
 
           cp resources/native/MainActivity.java \
@@ -176,7 +168,10 @@ jobs:
           p = Path("android/app/src/main/AndroidManifest.xml")
           s = p.read_text(encoding="utf-8")
 
-          permission = '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
+          permission = (
+              '    <uses-permission '
+              'android:name="android.permission.RECORD_AUDIO" />\n'
+          )
 
           if "android.permission.RECORD_AUDIO" not in s:
               s = s.replace("<application", permission + "<application", 1)
@@ -193,12 +188,12 @@ jobs:
               s = s.replace("<application", queries + "\n<application", 1)
 
           p.write_text(s, encoding="utf-8")
-          print("AndroidManifest.xml updated.")
+          print("Manifest updated.")
           PY
 
           echo "Native configuration applied."
 
-      # 7. بررسی تنظیمات پروژه
+      # 7. بررسی تنظیمات
       - name: Verify Kaseb configuration
         shell: bash
         run: |
@@ -216,7 +211,7 @@ jobs:
 
           echo "Kaseb configuration verified."
 
-      # 8. تنظیم امضای Release
+      # 8. تنظیم کلید امضای Release
       - name: Configure release signing
         shell: bash
         env:
@@ -227,33 +222,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${KEYSTORE_BASE64:-}" ] ||
-             [ -z "${KEYSTORE_PASSWORD:-}" ] ||
-             [ -z "${KEY_ALIAS:-}" ] ||
-             [ -z "${KEY_PASSWORD:-}" ]; then
-            echo "::error::Release signing secrets are incomplete."
-            exit 1
-          fi
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing signing secret: $name"
+              exit 1
+            fi
+          done
 
-          echo "$KEYSTORE_BASE64" | base64 --decode \
-            > "$RUNNER_TEMP/kaseb-release.jks"
+          KEYSTORE="$RUNNER_TEMP/kaseb-release.jks"
 
-          test -s "$RUNNER_TEMP/kaseb-release.jks"
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          test -s "$KEYSTORE"
 
           keytool -list \
-            -keystore "$RUNNER_TEMP/kaseb-release.jks" \
+            -keystore "$KEYSTORE" \
             -storepass "$KEYSTORE_PASSWORD" \
             -alias "$KEY_ALIAS" >/dev/null
 
+          echo "Keystore validated."
+
+          # افزودن پیکربندی امضا به Gradle
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           p = Path("android/app/build.gradle")
+
+          if not p.exists():
+              raise SystemExit("android/app/build.gradle not found.")
+
           s = p.read_text(encoding="utf-8")
 
-          if "signingConfigs {" not in s:
-              signing = """
+          marker = "// KASEB_RELEASE_SIGNING_CONFIG"
+
+          if marker in s:
+              raise SystemExit("Signing configuration already exists.")
+
+          signing = """
+
+          // KASEB_RELEASE_SIGNING_CONFIG
+          android {
               signingConfigs {
                   release {
                       storeFile file(System.getenv("KEYSTORE_PATH"))
@@ -263,37 +270,17 @@ jobs:
                   }
               }
 
-              """
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                  }
+              }
+          }
+          """
 
-              s, count = re.subn(
-                  r'(?m)^\\s*buildTypes\\s*\\{',
-                  signing + "buildTypes {",
-                  s,
-                  count=1
-              )
+          p.write_text(s + signing + "\\n", encoding="utf-8")
 
-              if count != 1:
-                  raise SystemExit("Could not find buildTypes block.")
-
-          pattern = r'(buildTypes\\s*\\{\\s*release\\s*\\{)'
-
-          if not re.search(
-              r'release\\s*\\{[^}]*signingConfig\\s+signingConfigs\\.release',
-              s,
-              re.S
-          ):
-              s, count = re.subn(
-                  pattern,
-                  r'\\1\n            signingConfig signingConfigs.release',
-                  s,
-                  count=1
-              )
-
-              if count != 1:
-                  raise SystemExit("Could not configure release signing.")
-
-          p.write_text(s, encoding="utf-8")
-          print("Release signing configured.")
+          print("Release signing configuration added.")
           PY
 
       # 9. ساخت APK امضاشده
@@ -334,7 +321,7 @@ jobs:
 
           echo "APK signature verified."
 
-      # 11. دریافت APK از بخش Artifacts
+      # 11. دریافت APK
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
@@ -343,7 +330,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 12. انتشار APK در GitHub Release هنگام ساخت Tag
+      # 12. انتشار در GitHub Release
       - name: Attach APK to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
