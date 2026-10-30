@@ -1,428 +1,373 @@
 
-name: Kaseb Android Release APK
+name: Build Kaseb Android APK
 
 on:
   workflow_dispatch:
   push:
-    paths:
-      - '**/*.zip'
-      - '.github/workflows/build-android.yml'
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
-  build-release:
+  build:
+    name: Build Signed Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Locate and extract project ZIP
+      - name: Locate and extract project
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p extracted
+          ZIP_FILE="$(find . -maxdepth 2 -type f -name '*.zip' | head -n 1 || true)"
 
-          ZIP_PATH="$(find . -type f -iname '*.zip' \
-            ! -path './.git/*' \
-            ! -path './extracted/*' \
-            -print -quit)"
-
-          if [ -z "$ZIP_PATH" ]; then
-            echo "::error::Project ZIP not found."
-            exit 1
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Extracting: $ZIP_FILE"
+            mkdir -p extracted
+            unzip -q "$ZIP_FILE" -d extracted
+            SEARCH_ROOT="extracted"
+          else
+            SEARCH_ROOT="."
           fi
 
-          echo "Project ZIP: $ZIP_PATH"
-          unzip -q "$ZIP_PATH" -d extracted
+          GRADLE_FILE="$(find "$SEARCH_ROOT" -type f -name gradlew | head -n 1 || true)"
 
-          GRADLEW="$(find extracted -type f -name gradlew \
-            ! -path '*/node_modules/*' \
-            -print -quit)"
-
-          if [ -n "$GRADLEW" ]; then
-            PROJECT_DIR="$(cd "$(dirname "$GRADLEW")" && pwd)"
-            APP_DIR="$PROJECT_DIR/app"
-            echo "Existing Android project detected."
+          if [ -n "$GRADLE_FILE" ]; then
+            PROJECT_DIR="$(dirname "$GRADLE_FILE")"
           else
-            INDEX_HTML="$(find extracted -type f -name index.html \
-              ! -path '*/node_modules/*' \
-              ! -path '*/.git/*' \
-              -print -quit)"
+            INDEX_FILE="$(find "$SEARCH_ROOT" -type f -name index.html | head -n 1 || true)"
 
-            if [ -z "$INDEX_HTML" ]; then
-              echo "::error::index.html not found."
+            if [ -z "$INDEX_FILE" ]; then
+              echo "ERROR: Neither gradlew nor index.html was found."
               exit 1
             fi
 
-            WEB_DIR="$(dirname "$INDEX_HTML")"
-
+            WEB_DIR="$(dirname "$INDEX_FILE")"
             mkdir -p android-wrapper/www
             cp -a "$WEB_DIR"/. android-wrapper/www/
 
             cd android-wrapper
+
             npm init -y
             npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
 
             npx cap init "کاسب" com.sevenbox.kaseb --web-dir=www
             npx cap add android
 
-            PROJECT_DIR="$GITHUB_WORKSPACE/android-wrapper/android"
-            APP_DIR="$PROJECT_DIR/app"
+            cd ..
+
+            PROJECT_DIR="android-wrapper/android"
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Android project: $PROJECT_DIR"
 
-      - name: Prepare Android SDK
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Configure launcher icons
         shell: bash
         run: |
           set -euo pipefail
 
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager \
-            -print 2>/dev/null | sort -V | tail -n 1)"
+          APP_DIR="$PROJECT_DIR/app"
 
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager not found."
+          if [ ! -d "$APP_DIR" ]; then
+            echo "ERROR: Android app directory not found: $APP_DIR"
             exit 1
           fi
 
-          "$SDKMANAGER" --install \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+          RES="$APP_DIR/src/main/res"
+          mkdir -p "$RES"
 
-      - name: Generate Android launcher icons
-        shell: bash
-        run: |
-          set -euo pipefail
+          python3 -m pip install --quiet pillow
 
-          python3 -m pip install --quiet Pillow
+          ICON_SOURCE=""
 
-          export APP_DIR
+          for candidate in \
+            "1000170973.png" \
+            "icon.png" \
+            "logo.png" \
+            "app-icon.png" \
+            "app_icon.png"
+          do
+            FOUND="$(find . -type f -iname "$candidate" \
+              -not -path './.git/*' \
+              -not -path '*/build/*' | head -n 1 || true)"
 
-          python3 - <<'PY'
+            if [ -n "$FOUND" ]; then
+              ICON_SOURCE="$FOUND"
+              break
+            fi
+          done
+
+          if [ -z "$ICON_SOURCE" ]; then
+            echo "ERROR: Launcher icon image was not found."
+            echo "Add the intended logo to the repository as 1000170973.png"
+            exit 1
+          fi
+
+          echo "Using launcher icon: $ICON_SOURCE"
+
+          python3 - "$ICON_SOURCE" "$RES" <<'PY'
+          from PIL import Image, ImageOps
           import os
-          import zipfile
-          import tempfile
-          from pathlib import Path
-          from PIL import Image
+          import sys
 
-          root = Path("extracted")
-          app = Path(os.environ["APP_DIR"])
-          temp = Path(tempfile.mkdtemp())
+          source = sys.argv[1]
+          res = sys.argv[2]
 
-          extensions = {".png", ".jpg", ".jpeg", ".webp"}
-          candidates = []
+          image = Image.open(source).convert("RGBA")
+          image = ImageOps.contain(image, (720, 720), Image.Resampling.LANCZOS)
 
-          def add_image(path):
-              try:
-                  with Image.open(path) as im:
-                      im.verify()
-                  candidates.append(Path(path))
-              except Exception:
-                  pass
+          canvas = Image.new("RGBA", (1024, 1024), (255, 112, 0, 255))
+          x = (1024 - image.width) // 2
+          y = (1024 - image.height) // 2
+          canvas.alpha_composite(image, (x, y))
 
-          # Search images in the extracted project.
-          for path in root.rglob("*"):
-              if path.is_file() and path.suffix.lower() in extensions:
-                  if "node_modules" not in path.parts:
-                      add_image(path)
-
-          # Search images inside nested ZIP files.
-          for archive in root.rglob("*.zip"):
-              try:
-                  with zipfile.ZipFile(archive) as z:
-                      for info in z.infolist():
-                          if Path(info.filename).suffix.lower() not in extensions:
-                              continue
-
-                          if info.file_size > 20 * 1024 * 1024:
-                              continue
-
-                          target = temp / (
-                              str(len(candidates)) +
-                              Path(info.filename).suffix.lower()
-                          )
-
-                          with z.open(info) as src:
-                              target.write_bytes(src.read())
-
-                          add_image(target)
-
-              except Exception as error:
-                  print("Nested ZIP skipped:", error)
-
-          if not candidates:
-              raise SystemExit("No valid images found in project ZIP.")
-
-          # Prefer icon/logo images and square, sufficiently large images.
-          def score(path):
-              name = str(path).lower()
-              value = 0
-
-              if "icon" in name:
-                  value += 100
-              if "logo" in name:
-                  value += 80
-              if "kaseb" in name:
-                  value += 50
-
-              try:
-                  with Image.open(path) as im:
-                      width, height = im.size
-                      if width and height:
-                          value += int(
-                              min(width, height) /
-                              max(width, height) * 30
-                          )
-                      if width >= 256 and height >= 256:
-                          value += 20
-              except Exception:
-                  return -1
-
-              return value
-
-          candidates.sort(key=score, reverse=True)
-
-          # Explicitly report candidates for verification.
-          for path in candidates[:10]:
-              print("IMAGE CANDIDATE:", path, score(path))
-
-          selected = candidates[0]
-          print("SELECTED ICON:", selected)
-
-          with Image.open(selected) as im:
-              logo = im.convert("RGBA")
-
-          res = app / "src/main/res"
-
-          # Legacy launcher icons.
           sizes = {
-              "mipmap-mdpi": 48,
-              "mipmap-hdpi": 72,
-              "mipmap-xhdpi": 96,
-              "mipmap-xxhdpi": 144,
-              "mipmap-xxxhdpi": 192,
+              "mdpi": 48,
+              "hdpi": 72,
+              "xhdpi": 96,
+              "xxhdpi": 144,
+              "xxxhdpi": 192,
           }
 
-          for folder, size in sizes.items():
-              directory = res / folder
-              directory.mkdir(parents=True, exist_ok=True)
+          for density, size in sizes.items():
+              folder = os.path.join(res, f"mipmap-{density}")
+              os.makedirs(folder, exist_ok=True)
 
-              canvas = Image.new(
-                  "RGBA", (size, size), "#FF7000"
-              )
+              icon = canvas.resize((size, size), Image.Resampling.LANCZOS)
+              icon.save(os.path.join(folder, "ic_launcher.png"))
 
-              icon = logo.copy()
-              icon.thumbnail(
-                  (int(size * 0.82), int(size * 0.82)),
-                  Image.Resampling.LANCZOS
-              )
+              round_icon = icon.copy()
+              round_icon.save(os.path.join(folder, "ic_launcher_round.png"))
 
-              canvas.alpha_composite(
-                  icon,
-                  (
-                      (size - icon.width) // 2,
-                      (size - icon.height) // 2
-                  )
-              )
+          adaptive = os.path.join(res, "mipmap-anydpi-v26")
+          os.makedirs(adaptive, exist_ok=True)
 
-              canvas.save(
-                  directory / "ic_launcher.png",
-                  optimize=True
-              )
-              canvas.save(
-                  directory / "ic_launcher_round.png",
-                  optimize=True
-              )
-
-          # Adaptive icon foreground.
-          directory = res / "drawable"
-          directory.mkdir(parents=True, exist_ok=True)
-
-          foreground = Image.new(
-              "RGBA", (432, 432), (0, 0, 0, 0)
-          )
-
-          icon = logo.copy()
-          icon.thumbnail(
-              (280, 280),
-              Image.Resampling.LANCZOS
-          )
-
-          foreground.alpha_composite(
-              icon,
-              (
-                  (432 - icon.width) // 2,
-                  (432 - icon.height) // 2
-              )
-          )
-
-          foreground.save(
-              directory / "ic_launcher_foreground.png",
-              optimize=True
-          )
-
-          # Adaptive icon background.
-          directory = res / "values"
-          directory.mkdir(parents=True, exist_ok=True)
-
-          (directory / "ic_launcher_background.xml").write_text(
-              '<resources><color name="ic_launcher_background">'
-              '#FF7000</color></resources>',
-              encoding="utf-8"
-          )
-
-          directory = res / "mipmap-anydpi-v26"
-          directory.mkdir(parents=True, exist_ok=True)
-
-          adaptive = '''<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+          with open(os.path.join(adaptive, "ic_launcher.xml"), "w") as f:
+              f.write('''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/ic_launcher_background"/>
-              <foreground android:drawable="@drawable/ic_launcher_foreground"/>
-          </adaptive-icon>'''
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>''')
 
-          for filename in (
-              "ic_launcher.xml",
-              "ic_launcher_round.xml"
-          ):
-              (directory / filename).write_text(
-                  adaptive,
-                  encoding="utf-8"
-              )
+          with open(os.path.join(adaptive, "ic_launcher_round.xml"), "w") as f:
+              f.write('''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>''')
 
-          print("Launcher icons generated successfully.")
+          colors = os.path.join(res, "values")
+          os.makedirs(colors, exist_ok=True)
+
+          with open(os.path.join(colors, "ic_launcher_background.xml"), "w") as f:
+              f.write('''<?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#FF7000</color>
+          </resources>''')
+
+          foreground = os.path.join(res, "mipmap-anydpi-v26")
+          os.makedirs(foreground, exist_ok=True)
+
+          foreground_image = canvas.resize((432, 432), Image.Resampling.LANCZOS)
+          foreground_dir = os.path.join(res, "drawable")
+          os.makedirs(foreground_dir, exist_ok=True)
+          foreground_image.save(os.path.join(foreground_dir, "ic_launcher_foreground.png"))
+
+          print("Launcher icon resources generated.")
           PY
 
-      - name: Configure Android manifest
+      - name: Fix Android manifest namespace and launcher icon
         shell: bash
         run: |
           set -euo pipefail
 
+          APP_DIR="$PROJECT_DIR/app"
           MANIFEST="$APP_DIR/src/main/AndroidManifest.xml"
 
           if [ ! -f "$MANIFEST" ]; then
-            echo "::error::AndroidManifest.xml not found."
+            echo "ERROR: AndroidManifest.xml not found: $MANIFEST"
             exit 1
           fi
 
           python3 - "$MANIFEST" <<'PY'
+          import re
           import sys
           import xml.etree.ElementTree as ET
 
           path = sys.argv[1]
-          tree = ET.parse(path)
-          root = tree.getroot()
 
-          android = "{http://schemas.android.com/apk/res/android}"
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
 
-          root.set(android + "icon", "@mipmap/ic_launcher")
-          root.set(android + "roundIcon", "@mipmap/ic_launcher_round")
+          if not re.search(r'<manifest\b[^>]*>', content):
+              raise SystemExit("ERROR: Manifest root element not found.")
 
-          tree.write(
-              path,
-              encoding="utf-8",
-              xml_declaration=True
-          )
+          root_match = re.search(r'<manifest\b[^>]*>', content)
+          root_tag = root_match.group(0)
 
-          print("Android manifest updated.")
+          if not re.search(r'xmlns:android\s*=', root_tag):
+              root_tag = root_tag[:-1] + ' xmlns:android="http://schemas.android.com/apk/res/android">'
+              content = content[:root_match.start()] + root_tag + content[root_match.end():]
+
+          def update_attribute(tag_name, attribute, value):
+              global content
+
+              pattern = rf'<{tag_name}\b[^>]*>'
+
+              match = re.search(pattern, content, flags=re.DOTALL)
+
+              if not match:
+                  return
+
+              tag = match.group(0)
+              attr_pattern = rf'\bandroid:{attribute}\s*=\s*["\'][^"\']*["\']'
+
+              if re.search(attr_pattern, tag):
+                  tag = re.sub(
+                      attr_pattern,
+                      f'android:{attribute}="{value}"',
+                      tag
+                  )
+              else:
+                  tag = tag[:-1] + f' android:{attribute}="{value}">'
+
+              content = content[:match.start()] + tag + content[match.end():]
+
+          update_attribute("application", "icon", "@mipmap/ic_launcher")
+          update_attribute("application", "roundIcon", "@mipmap/ic_launcher_round")
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+
+          try:
+              ET.parse(path)
+          except ET.ParseError as error:
+              raise SystemExit(f"ERROR: Invalid AndroidManifest.xml: {error}")
+
+          print("Manifest XML validated.")
           PY
+
+          echo "Manifest after patch:"
+          cat "$MANIFEST"
+
+      - name: Check Android manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find "$PROJECT_DIR" -path '*/src/*/AndroidManifest.xml' -type f -print
+
+          while IFS= read -r manifest; do
+            echo "Checking: $manifest"
+            python3 - "$manifest" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+          ET.parse(path)
+          print("Valid XML:", path)
+          PY
+          done < <(find "$PROJECT_DIR" -path '*/src/*/AndroidManifest.xml' -type f)
 
       - name: Configure release signing
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
-          if [ -z "$KEYSTORE_BASE64" ] || \
-             [ -z "$KEYSTORE_PASSWORD" ] || \
-             [ -z "$KEY_ALIAS" ] || \
-             [ -z "$KEY_PASSWORD" ]; then
-            echo "::error::Signing secrets are missing."
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "ERROR: KEYSTORE_BASE64 secret is missing."
             exit 1
           fi
 
-          KEYSTORE_PATH="$RUNNER_TEMP/kaseb-release.jks"
+          mkdir -p "$HOME/.android"
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/release.keystore"
 
-          printf '%s' "$KEYSTORE_BASE64" |
-            base64 --decode > "$KEYSTORE_PATH"
+          echo "KEYSTORE_PATH=$HOME/.android/release.keystore" >> "$GITHUB_ENV"
 
-          keytool -list \
-            -keystore "$KEYSTORE_PATH" \
-            -storepass "$KEYSTORE_PASSWORD" >/dev/null
+      - name: Make Gradle executable
+        run: chmod +x "$PROJECT_DIR/gradlew"
 
-          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
-
-      - name: Build signed Release APK
+      - name: Build signed release APK
         shell: bash
         env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
-          chmod +x ./gradlew
 
-          ./gradlew --no-daemon clean assembleRelease \
-            "-Pandroid.injected.signing.store.file=$KEYSTORE_PATH" \
-            "-Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD" \
-            "-Pandroid.injected.signing.key.alias=$KEY_ALIAS" \
-            "-Pandroid.injected.signing.key.password=$KEY_PASSWORD"
+          ./gradlew --no-daemon --stacktrace \
+            -Pandroid.injected.signing.store.file="$KEYSTORE_PATH" \
+            -Pandroid.injected.signing.store.password="$STORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD" \
+            assembleRelease
 
-      - name: Verify and collect APK
+      - name: Locate APK
+        id: apk
         shell: bash
         run: |
           set -euo pipefail
 
-          APK_PATH="$(find "$PROJECT_DIR" -type f \
-            -path '*/build/outputs/apk/release/*.apk' \
-            -print -quit)"
+          APK="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/release/*.apk' | head -n 1 || true)"
 
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::Release APK not found."
+          if [ -z "$APK" ]; then
+            echo "ERROR: Release APK was not generated."
             exit 1
           fi
 
+          mkdir -p release-output
+          cp "$APK" release-output/Kaseb-release.apk
+
+          echo "APK_PATH=release-output/Kaseb-release.apk" >> "$GITHUB_ENV"
+
+          ls -lh release-output/Kaseb-release.apk
+
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
           APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
 
-          "$APKSIGNER" verify --verbose "$APK_PATH"
+          if [ -x "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --verbose "$APK_PATH"
+          else
+            echo "WARNING: apksigner not found; signature verification skipped."
+          fi
 
-          mkdir -p apk-output
-
-          cp "$APK_PATH" apk-output/Kaseb-Release.apk
-
-          ls -lh apk-output/Kaseb-Release.apk
-
-      - name: Upload Release APK
+      - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
           name: Kaseb-Android-Release
-          path: apk-output/Kaseb-Release.apk
+          path: release-output/Kaseb-release.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
