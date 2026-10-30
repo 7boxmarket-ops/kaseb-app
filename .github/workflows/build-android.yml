@@ -23,32 +23,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. استخراج ZIP اصلی و پیدا کردن ریشه واقعی پروژه
-      - name: Extract and prepare Kaseb project
+      # 2. استخراج ZIP اصلی پروژه
+      - name: Extract Kaseb project
         shell: bash
         run: |
           set -euo pipefail
 
           WORK="$GITHUB_WORKSPACE"
           TEMP="$RUNNER_TEMP/kaseb-extracted"
-
-          mkdir -p "$TEMP"
+          ARCHIVE="$WORK/kaseb-github-release-project-2.zip"
 
           echo "Repository files:"
           find "$WORK" -maxdepth 3 -type f \
             ! -path '*/.git/*' | sort
 
-          ARCHIVE="$WORK/kaseb-app-release-project.zip"
-
           if [ ! -f "$ARCHIVE" ]; then
-            echo "::error::kaseb-app-release-project.zip was not found in repository root."
+            echo "::error::Project ZIP not found: $ARCHIVE"
             exit 1
           fi
 
-          echo "Extracting project archive..."
-          unzip -oq "$ARCHIVE" -d "$TEMP"
+          mkdir -p "$TEMP"
 
-          echo "Searching for project root..."
+          echo "Extracting project ZIP..."
+          unzip -oq "$ARCHIVE" -d "$TEMP"
 
           PROJECT_ROOT=""
 
@@ -59,53 +56,53 @@ jobs:
                [ -f "$candidate/package.json" ] &&
                [ -d "$candidate/resources/android" ] &&
                [ -f "$candidate/resources/native/MainActivity.java" ]; then
-
               PROJECT_ROOT="$candidate"
               break
             fi
           done < <(find "$TEMP" -type f -name package.json -print0)
 
           if [ -z "$PROJECT_ROOT" ]; then
-            echo "::error::Kaseb project root not found inside archive."
-            echo "Extracted files:"
+            echo "::error::Could not find Kaseb project root inside ZIP."
             find "$TEMP" -maxdepth 6 -type f | sort
             exit 1
           fi
 
           echo "Project root: $PROJECT_ROOT"
 
-          # انتقال محتوای پروژه به ریشه workspace
+          # انتقال محتوای پروژه به ریشه مخزن
           cp -a "$PROJECT_ROOT"/. "$WORK"/
 
-          # بررسی سورس اصلی
+          # استخراج HTML اصلی برنامه
           if [ -f "$WORK/source/kaseb-source.zip" ]; then
             mkdir -p "$RUNNER_TEMP/kaseb-source"
+
             unzip -oq "$WORK/source/kaseb-source.zip" \
               -d "$RUNNER_TEMP/kaseb-source"
 
             if [ ! -s "$RUNNER_TEMP/kaseb-source/index.html" ]; then
-              echo "::error::index.html is missing inside source ZIP."
+              echo "::error::index.html missing inside source ZIP."
               exit 1
             fi
 
-            cp "$RUNNER_TEMP/kaseb-source/index.html" "$WORK/index.html"
+            cp "$RUNNER_TEMP/kaseb-source/index.html" \
+              "$WORK/index.html"
 
           elif [ -s "$WORK/index.html" ]; then
-            echo "Using existing index.html."
+            echo "Using project index.html."
 
           else
-            echo "::error::Neither source ZIP nor index.html exists."
+            echo "::error::Kaseb index.html was not found."
             exit 1
           fi
 
-          # بررسی نهایی فایل‌های ضروری
+          # بررسی فایل‌های ضروری
           test -s "$WORK/index.html"
           test -f "$WORK/package.json"
           test -f "$WORK/capacitor.config.json"
           test -d "$WORK/resources/android"
           test -f "$WORK/resources/native/MainActivity.java"
 
-          echo "Kaseb project prepared successfully."
+          echo "Kaseb project extracted successfully."
 
       # 3. نصب Node.js
       - name: Set up Node.js
@@ -120,7 +117,7 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # 5. نصب وابستگی‌ها و ساخت پروژه اندروید
+      # 5. نصب وابستگی‌ها و ساخت پروژه Android
       - name: Install dependencies and prepare Android
         shell: bash
         run: |
@@ -131,17 +128,15 @@ jobs:
           mkdir -p www
           cp index.html www/index.html
 
-          # ساخت پروژه اندروید Capacitor
-          rm -rf android
           npx cap add android
           npx cap sync android
 
           test -f android/gradlew
           test -f android/app/build.gradle
 
-          echo "Android project generated successfully."
+          echo "Android project prepared."
 
-      # 6. اعمال آیکون، پل بومی و مجوز میکروفون
+      # 6. اعمال آیکون و تنظیمات بومی
       - name: Apply Kaseb native configuration
         shell: bash
         run: |
@@ -174,23 +169,19 @@ jobs:
           cp resources/native/MainActivity.java \
             "$JAVA_DIR/MainActivity.java"
 
-          # مجوز میکروفون و دسترسی سرویس تشخیص گفتار
+          # مجوز میکروفون و سرویس تشخیص گفتار
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          manifest = Path("android/app/src/main/AndroidManifest.xml")
-          content = manifest.read_text(encoding="utf-8")
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text(encoding="utf-8")
 
-          if "android.permission.RECORD_AUDIO" not in content:
-              content = content.replace(
-                  "<application",
-                  '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
-                  "<application",
-                  1
-              )
+          permission = '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
 
-          if "android.speech.RecognitionService" not in content:
+          if "android.permission.RECORD_AUDIO" not in s:
+              s = s.replace("<application", permission + "<application", 1)
+
+          if "android.speech.RecognitionService" not in s:
               queries = """
               <queries>
                   <intent>
@@ -199,22 +190,15 @@ jobs:
               </queries>
               """
 
-              if "<application" in content:
-                  content = content.replace(
-                      "<application",
-                      queries + "\n    <application",
-                      1
-                  )
-              else:
-                  raise SystemExit("Manifest application tag not found.")
+              s = s.replace("<application", queries + "\n<application", 1)
 
-          manifest.write_text(content, encoding="utf-8")
-          print("Manifest updated.")
+          p.write_text(s, encoding="utf-8")
+          print("AndroidManifest.xml updated.")
           PY
 
           echo "Native configuration applied."
 
-      # 7. بررسی تنظیمات
+      # 7. بررسی تنظیمات پروژه
       - name: Verify Kaseb configuration
         shell: bash
         run: |
@@ -232,7 +216,7 @@ jobs:
 
           echo "Kaseb configuration verified."
 
-      # 8. تنظیم امضای نسخه Release
+      # 8. تنظیم امضای Release
       - name: Configure release signing
         shell: bash
         env:
@@ -247,7 +231,6 @@ jobs:
              [ -z "${KEYSTORE_PASSWORD:-}" ] ||
              [ -z "${KEY_ALIAS:-}" ] ||
              [ -z "${KEY_PASSWORD:-}" ]; then
-
             echo "::error::Release signing secrets are incomplete."
             exit 1
           fi
@@ -257,7 +240,6 @@ jobs:
 
           test -s "$RUNNER_TEMP/kaseb-release.jks"
 
-          # بررسی معتبر بودن فایل کلید
           keytool -list \
             -keystore "$RUNNER_TEMP/kaseb-release.jks" \
             -storepass "$KEYSTORE_PASSWORD" \
@@ -267,10 +249,10 @@ jobs:
           from pathlib import Path
           import re
 
-          gradle = Path("android/app/build.gradle")
-          content = gradle.read_text(encoding="utf-8")
+          p = Path("android/app/build.gradle")
+          s = p.read_text(encoding="utf-8")
 
-          if "signingConfigs {" not in content:
+          if "signingConfigs {" not in s:
               signing = """
               signingConfigs {
                   release {
@@ -283,34 +265,34 @@ jobs:
 
               """
 
-              content, count = re.subn(
+              s, count = re.subn(
                   r'(?m)^\\s*buildTypes\\s*\\{',
                   signing + "buildTypes {",
-                  content,
+                  s,
                   count=1
               )
 
               if count != 1:
-                  raise SystemExit("Could not locate buildTypes block.")
+                  raise SystemExit("Could not find buildTypes block.")
+
+          pattern = r'(buildTypes\\s*\\{\\s*release\\s*\\{)'
 
           if not re.search(
-              r'buildTypes\\s*\\{\\s*release\\s*\\{[^}]*signingConfig',
-              content,
+              r'release\\s*\\{[^}]*signingConfig\\s+signingConfigs\\.release',
+              s,
               re.S
           ):
-              pattern = r'(buildTypes\\s*\\{\\s*release\\s*\\{)'
-
-              content, count = re.subn(
+              s, count = re.subn(
                   pattern,
                   r'\\1\n            signingConfig signingConfigs.release',
-                  content,
+                  s,
                   count=1
               )
 
               if count != 1:
-                  raise SystemExit("Could not attach release signing config.")
+                  raise SystemExit("Could not configure release signing.")
 
-          gradle.write_text(content, encoding="utf-8")
+          p.write_text(s, encoding="utf-8")
           print("Release signing configured.")
           PY
 
@@ -338,9 +320,21 @@ jobs:
             exit 1
           fi
 
-          echo "APK generated successfully."
+          echo "Release APK generated."
 
-      # 10. بارگذاری APK
+      # 10. بررسی امضای APK
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+
+          apksigner verify --verbose "$APK"
+
+          echo "APK signature verified."
+
+      # 11. دریافت APK از بخش Artifacts
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
@@ -349,7 +343,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 11. پیوست APK به GitHub Release در صورت ساخت Tag
+      # 12. انتشار APK در GitHub Release هنگام ساخت Tag
       - name: Attach APK to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
