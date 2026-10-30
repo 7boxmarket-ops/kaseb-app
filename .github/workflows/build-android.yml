@@ -96,34 +96,56 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android Build Tools
+      - name: Install Android SDK Build Tools
         shell: bash
         run: |
           set -euo pipefail
 
-          sdkmanager --install "platform-tools" "build-tools;35.0.0"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-
-          if [ -z "$SDK_ROOT" ]; then
-            echo "::error::ANDROID_HOME and ANDROID_SDK_ROOT are both unset."
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK directory not found: $SDK_ROOT"
             exit 1
           fi
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print 2>/dev/null | sort -V | tail -n 1)"
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager was not found in Android SDK command-line tools."
+            find "$SDK_ROOT" -type f -name sdkmanager -print || true
+            exit 1
+          fi
+
+          echo "Android SDK: $SDK_ROOT"
+          echo "SDK Manager: $SDKMANAGER"
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          echo "Accepting Android SDK licenses..."
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
+          set -o pipefail
+
+          echo "Installing Android platform tools and Build Tools..."
+          "$SDKMANAGER" \
+            --sdk_root="$SDK_ROOT" \
+            --install \
+            "platform-tools" \
+            "build-tools;35.0.0"
 
           APKSIGNER="$SDK_ROOT/build-tools/35.0.0/apksigner"
 
           if [ ! -x "$APKSIGNER" ]; then
-            echo "::error::apksigner was not found after installing Android Build Tools."
+            echo "::error::apksigner installation failed."
             find "$SDK_ROOT/build-tools" -type f -name apksigner -print || true
             exit 1
           fi
 
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
           echo "$SDK_ROOT/build-tools/35.0.0" >> "$GITHUB_PATH"
 
-          echo "Installed Android Build Tools:"
+          echo "Installed apksigner:"
           "$APKSIGNER" version
 
       - name: Install dependencies and prepare Android project
@@ -338,12 +360,6 @@ jobs:
           fi
 
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-
-          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT/build-tools" ]; then
-            echo "::error::Android SDK Build Tools directory was not found."
-            exit 1
-          fi
-
           APKSIGNER="$SDK_ROOT/build-tools/35.0.0/apksigner"
 
           if [ ! -x "$APKSIGNER" ]; then
